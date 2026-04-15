@@ -98,7 +98,7 @@ def torch_index_url(cuda_version: str) -> Optional[str]:
 
 def restore_torch(state: dict) -> bool:
     """
-    Force-reinstall the exact original torch + torchaudio CUDA build.
+    Force-reinstall the exact original torch + torchaudio + torchvision CUDA build.
     Returns True on success.
     """
     index_url = torch_index_url(state["cuda_version"])
@@ -111,7 +111,7 @@ def restore_torch(state: dict) -> bool:
         [sys.executable, "-m", "pip", "install",
          "--no-user", "--force-reinstall",
          "--index-url", index_url,
-         f"torch=={base}", f"torchaudio=={base}"],
+         f"torch=={base}", f"torchaudio=={base}"], f"torchvision=={base}"],
         env=clean_env(),
     )
     return result.returncode == 0
@@ -236,7 +236,7 @@ def install() -> None:
                     f"{TAG}     python -m pip install --force-reinstall --no-user \\\n"
                     f"{TAG}       --index-url https://download.pytorch.org/whl/"
                     f"{torch_index_url(torch_before['cuda_version']) or 'cu128'} \\\n"
-                    f"{TAG}       torch torchaudio"
+                    f"{TAG}       torch torchaudio torchvision"
                 )
         else:
             after = get_torch_state()
