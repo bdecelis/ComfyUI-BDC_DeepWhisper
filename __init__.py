@@ -24,7 +24,7 @@ from __future__ import annotations
 # A clear error here is far more helpful than a cryptic ImportError later.
 # ---------------------------------------------------------------------------
 try:
-    import pipeline  # noqa: F401 — confirms deep-whisper is installed
+    import deep_whisper.pipeline  # noqa: F401 — confirms deep-whisper is installed
 except ImportError:
     print(
         "\n[ComfyUI-BDC_DeepWhisper] ERROR: deep-whisper is not installed.\n"
