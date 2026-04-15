@@ -111,7 +111,7 @@ def restore_torch(state: dict) -> bool:
         [sys.executable, "-m", "pip", "install",
          "--no-user", "--force-reinstall",
          "--index-url", index_url,
-         f"torch=={base}", f"torchaudio=={base}"], f"torchvision=={base}"],
+         f"torch=={base}", f"torchaudio=={base}", f"torchvision=={base}"],
         env=clean_env(),
     )
     return result.returncode == 0
