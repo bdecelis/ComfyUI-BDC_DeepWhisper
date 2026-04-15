@@ -100,12 +100,12 @@ class TranscribeNode:
         timestamp_level: str,
     ) -> tuple[str]:
 
-        from pipeline.audio       import load_audio, normalize_audio
-        from pipeline.vad         import get_speech_chunks
-        from pipeline.transcribe  import transcribe_chunks
-        from pipeline.normalise   import normalise_segments
-        from pipeline.align       import align_segments
-        from pipeline.postprocess import build_output, serialise
+        from deep_whisper.pipeline.audio       import load_audio, normalize_audio
+        from deep_whisper.pipeline.vad         import get_speech_chunks
+        from deep_whisper.pipeline.transcribe  import transcribe_chunks
+        from deep_whisper.pipeline.normalise   import normalise_segments
+        from deep_whisper.pipeline.align       import align_segments
+        from deep_whisper.pipeline.postprocess import build_output, serialise
 
         audio    = normalize_audio(load_audio(audio_path))
         chunks   = get_speech_chunks(audio)
