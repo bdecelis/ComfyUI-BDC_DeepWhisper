@@ -5,21 +5,28 @@ Executed automatically by ComfyUI Manager when this custom node is installed
 or updated. Installs the deep-whisper package into ComfyUI's Python
 environment using sys.executable.
 
-Two known issues are handled automatically here:
+Known issues handled automatically:
 
 1. pytorch-lightning invalid requirement (pip 24.1+)
-   Old versions of pytorch-lightning in the user site-packages have a
-   malformed version specifier that pip 24.1+ rejects during dependency
-   resolution. --no-user prevents pip from scanning user site-packages,
-   avoiding the collision entirely.
+   pytorch-lightning < 2.0.0 ships with a malformed version specifier
+   (torch>=1.9.*) that pip 24.1+ rejects during dependency resolution.
+
+   This persists even with --no-user because ComfyUI (and some custom nodes)
+   explicitly add the user site-packages directory to sys.path via
+   sys.path.append(). pip inherits this sys.path and sees the broken package
+   regardless of --no-user, which only controls install targets.
+
+   Fix: set PYTHONNOUSERSITE=1 in the subprocess environment. This prevents
+   Python from adding the user site-packages to sys.path in the pip subprocess
+   before pip starts, so the broken package is never visible to the resolver.
 
 2. whisperx overwrites CUDA torch with a CPU-only build
-   whisperx pulls in a CPU-only torch as a transitive dependency, which
-   silently replaces ComfyUI's CUDA build. We capture the exact torch
-   version and CUDA tag before installing, then detect and repair the
-   breakage automatically after.
+   whisperx pulls in a CPU-only torch as a transitive dependency, silently
+   replacing ComfyUI's CUDA build. We capture the torch state before, then
+   detect and restore automatically after if broken.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,11 +35,42 @@ from pathlib import Path
 TAG = "[ComfyUI-BDC_DeepWhisper]"
 
 
+def clean_env() -> dict:
+    """
+    Return a copy of os.environ with PYTHONNOUSERSITE=1 set.
+
+    This prevents Python from adding the user site-packages directory
+    (e.g. AppData/Roaming/Python/Python312/site-packages) to sys.path
+    in any subprocess we spawn. Without this, pip inherits the parent
+    process's sys.path — which ComfyUI has already populated with the
+    user site — and sees any broken packages installed there, even when
+    --no-user is passed.
+    """
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 def pip_run(*args: str) -> None:
-    """Run a pip command using ComfyUI's Python. Always uses --no-user."""
+    """
+    Run a pip command using ComfyUI's Python.
+    Always sets PYTHONNOUSERSITE=1 and --no-user for a clean resolution
+    environment regardless of what the parent process has on sys.path.
+    """
     subprocess.run(
         [sys.executable, "-m", "pip", *args, "--no-user"],
+        env=clean_env(),
         check=True,
+    )
+
+
+def run_python(*args: str) -> subprocess.CompletedProcess:
+    """Run a Python one-liner in a clean environment (no user site-packages)."""
+    return subprocess.run(
+        [sys.executable, *args],
+        capture_output=True,
+        text=True,
+        env=clean_env(),
     )
 
 
@@ -41,15 +79,12 @@ def get_torch_state() -> dict | None:
     Return the current torch version, CUDA version, and CUDA availability.
     Returns None if torch is not installed.
     """
-    result = subprocess.run(
-        [
-            sys.executable, "-c",
-            "import torch; "
-            "print(torch.__version__); "
-            "print(torch.version.cuda or 'None'); "
-            "print(torch.cuda.is_available())"
-        ],
-        capture_output=True, text=True,
+    result = run_python(
+        "-c",
+        "import torch; "
+        "print(torch.__version__); "
+        "print(torch.version.cuda or 'None'); "
+        "print(torch.cuda.is_available())"
     )
     if result.returncode != 0:
         return None
@@ -66,7 +101,7 @@ def get_torch_state() -> dict | None:
 def torch_index_url(cuda_version: str) -> str | None:
     """
     Map a torch.version.cuda string to the matching PyTorch index URL.
-    Returns None if no matching tag is found (e.g. CPU-only or unknown).
+    Returns None if no matching tag is found.
     """
     if not cuda_version or cuda_version == "None":
         return None
@@ -90,8 +125,8 @@ def torch_index_url(cuda_version: str) -> str | None:
 def restore_torch(version: str, index_url: str) -> None:
     """
     Force-reinstall an exact torch + torchaudio build from the given index.
-    Strips the local version suffix (e.g. +cu128) before reinstalling so
-    pip can resolve the package from the remote index.
+    Strips the local version suffix (e.g. +cu128) so pip can resolve it
+    from the remote index.
     """
     base_version = version.split("+")[0]
     print(f"{TAG} Restoring torch=={base_version} from {index_url} ...")
@@ -104,33 +139,24 @@ def restore_torch(version: str, index_url: str) -> None:
             f"torch=={base_version}",
             f"torchaudio=={base_version}",
         ],
+        env=clean_env(),
         check=True,
     )
 
 
 def fix_broken_packages() -> None:
     """
-    Remove or upgrade packages with known invalid metadata that cause
-    pip 24.1+ to abort dependency resolution.
+    Detect and fix packages with known invalid metadata that cause pip 24.1+
+    to abort dependency resolution.
 
-    pytorch-lightning 1.7.7 ships with a malformed version specifier
-    (torch>=1.9.*) that pip 24.1+ rejects. It appears in some ComfyUI
-    environments pre-installed by other custom nodes or by ComfyUI itself.
-    Since deep-whisper does not use pytorch-lightning, we either remove it
-    (if nothing else depends on it) or upgrade it to a version with valid
-    metadata (>=2.0.0 has the fix).
-
-    This must run before any pip install that resolves dependencies,
-    because pip fails during the resolution phase — not the install phase.
+    pytorch-lightning < 2.0.0 ships with torch>=1.9.* which is invalid.
+    We upgrade it rather than removing it — safer if other nodes depend on it.
+    Falls back to removal if the upgrade itself fails.
     """
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "show", "pytorch-lightning"],
-        capture_output=True, text=True,
-    )
+    result = run_python("-m", "pip", "show", "pytorch-lightning")
     if result.returncode != 0:
-        return  # not installed — nothing to do
+        return  # not installed
 
-    # Extract installed version
     version = ""
     for line in result.stdout.splitlines():
         if line.startswith("Version:"):
@@ -140,36 +166,37 @@ def fix_broken_packages() -> None:
     if not version:
         return
 
-    # Check if the version has the broken specifier (< 2.0.0)
     try:
         major = int(version.split(".")[0])
     except (ValueError, IndexError):
         major = 0
 
     if major >= 2:
-        return  # version is fine
+        return  # already a valid version
 
     print(
         f"{TAG} Found pytorch-lightning {version} with invalid pip metadata.\n"
-        f"{TAG} Upgrading to a version with valid metadata before proceeding..."
+        f"{TAG} Upgrading before dependency resolution..."
     )
-    # Upgrade rather than remove — safer if something in the environment
-    # depends on it. pytorch-lightning 2.x has valid version specifiers.
+
     upgrade = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-user",
          "pytorch-lightning>=2.0.0"],
+        env=clean_env(),
         capture_output=True, text=True,
     )
+
     if upgrade.returncode == 0:
         print(f"{TAG} pytorch-lightning upgraded successfully.")
     else:
-        # Upgrade failed — try removing it instead
         print(
-            f"{TAG} Upgrade failed. Attempting to remove pytorch-lightning...\n"
+            f"{TAG} Upgrade failed — removing pytorch-lightning instead.\n"
             f"{TAG} (It will be reinstalled at a valid version if required.)"
         )
         subprocess.run(
-            [sys.executable, "-m", "pip", "uninstall", "pytorch-lightning", "-y"],
+            [sys.executable, "-m", "pip", "uninstall",
+             "pytorch-lightning", "-y"],
+            env=clean_env(),
             check=True,
         )
         print(f"{TAG} pytorch-lightning removed.")
@@ -177,9 +204,11 @@ def fix_broken_packages() -> None:
 
 def install() -> None:
 
-    # ── 0. Fix any known broken packages before resolving dependencies ───
+    # ── 0. Fix known broken packages before resolving dependencies ───────
     print(f"{TAG} Checking for known dependency conflicts...")
     fix_broken_packages()
+
+    # ── 1. Capture torch state before any installs ────────────────────────
     print(f"{TAG} Checking torch before install...")
     before = get_torch_state()
     if before:
@@ -200,7 +229,7 @@ def install() -> None:
         print(f"{TAG} Installing deep-whisper ...")
         pip_run("install", "deep-whisper>=0.1.0")
 
-    # ── 3. Detect and repair torch breakage ──────────────────────────────
+    # ── 3. Detect and repair torch breakage caused by whisperx ───────────
     if before and before["cuda_available"]:
         print(f"{TAG} Verifying torch CUDA after install...")
         after = get_torch_state()
@@ -221,7 +250,6 @@ def install() -> None:
             if index_url:
                 restore_torch(before["version"], index_url)
 
-                # Final verification
                 final = get_torch_state()
                 if final and final["cuda_available"]:
                     print(
@@ -243,8 +271,6 @@ def install() -> None:
                 print(
                     f"\n{TAG} Could not determine PyTorch index URL for "
                     f"CUDA {before['cuda_version']}.\n"
-                    f"{TAG} Please reinstall torch manually with the correct "
-                    f"--index-url for your CUDA version.\n"
                     f"{TAG} See: https://github.com/bdecelis/deep-whisper#installation\n"
                 )
         else:
