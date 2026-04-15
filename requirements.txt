@@ -1,0 +1,12 @@
+# ComfyUI-BDC_DeepWhisper · requirements.txt
+# ============================================
+# This file is intentionally minimal. deep-whisper declares all pipeline
+# dependencies (faster-whisper, whisperx, silero-vad, etc.) in its own
+# pyproject.toml — pip resolves them automatically when deep-whisper is
+# installed.
+#
+# PyTorch is NOT listed here. ComfyUI already has a CUDA-specific PyTorch
+# installed in its environment, and we must not replace it. deep-whisper
+# detects and reuses the existing torch.version.cuda automatically.
+
+deep-whisper>=0.1.0
