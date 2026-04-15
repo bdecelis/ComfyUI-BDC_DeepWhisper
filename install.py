@@ -108,9 +108,78 @@ def restore_torch(version: str, index_url: str) -> None:
     )
 
 
+def fix_broken_packages() -> None:
+    """
+    Remove or upgrade packages with known invalid metadata that cause
+    pip 24.1+ to abort dependency resolution.
+
+    pytorch-lightning 1.7.7 ships with a malformed version specifier
+    (torch>=1.9.*) that pip 24.1+ rejects. It appears in some ComfyUI
+    environments pre-installed by other custom nodes or by ComfyUI itself.
+    Since deep-whisper does not use pytorch-lightning, we either remove it
+    (if nothing else depends on it) or upgrade it to a version with valid
+    metadata (>=2.0.0 has the fix).
+
+    This must run before any pip install that resolves dependencies,
+    because pip fails during the resolution phase — not the install phase.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "show", "pytorch-lightning"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return  # not installed — nothing to do
+
+    # Extract installed version
+    version = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("Version:"):
+            version = line.split(":", 1)[1].strip()
+            break
+
+    if not version:
+        return
+
+    # Check if the version has the broken specifier (< 2.0.0)
+    try:
+        major = int(version.split(".")[0])
+    except (ValueError, IndexError):
+        major = 0
+
+    if major >= 2:
+        return  # version is fine
+
+    print(
+        f"{TAG} Found pytorch-lightning {version} with invalid pip metadata.\n"
+        f"{TAG} Upgrading to a version with valid metadata before proceeding..."
+    )
+    # Upgrade rather than remove — safer if something in the environment
+    # depends on it. pytorch-lightning 2.x has valid version specifiers.
+    upgrade = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-user",
+         "pytorch-lightning>=2.0.0"],
+        capture_output=True, text=True,
+    )
+    if upgrade.returncode == 0:
+        print(f"{TAG} pytorch-lightning upgraded successfully.")
+    else:
+        # Upgrade failed — try removing it instead
+        print(
+            f"{TAG} Upgrade failed. Attempting to remove pytorch-lightning...\n"
+            f"{TAG} (It will be reinstalled at a valid version if required.)"
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "pytorch-lightning", "-y"],
+            check=True,
+        )
+        print(f"{TAG} pytorch-lightning removed.")
+
+
 def install() -> None:
 
-    # ── 1. Capture torch state before any installs ────────────────────────
+    # ── 0. Fix any known broken packages before resolving dependencies ───
+    print(f"{TAG} Checking for known dependency conflicts...")
+    fix_broken_packages()
     print(f"{TAG} Checking torch before install...")
     before = get_torch_state()
     if before:
