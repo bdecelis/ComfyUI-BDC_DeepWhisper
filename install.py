@@ -1,33 +1,28 @@
 """
 ComfyUI-BDC_DeepWhisper · install.py
 =====================================
-Executed automatically by ComfyUI Manager when this custom node is installed
-or updated. Installs the deep-whisper package into ComfyUI's Python
-environment using sys.executable.
+Executed automatically by ComfyUI Manager when this node is installed
+or updated. Uses sys.executable — always ComfyUI's own Python.
 
-Known issues handled here:
+Flow
+----
+1. Fix known broken packages (pytorch-lightning < 2.0.0)
+2. Capture torch state before any pip installs
+3. pip install deep-whisper  ← may break torch (silero-vad declares a torch dep)
+4. Repair torch immediately if broken (we know the right version from step 2)
+5. Delegate the full GPU stack to deep_whisper.pipeline.setup_gpu
+   (handles faster-whisper, whisperx, cuDNN, torch protection, verification)
 
-1. pytorch-lightning invalid requirement (pip 24.1+)
-   pytorch-lightning < 2.0.0 has a malformed version specifier (torch>=1.9.*)
-   that pip 24.1+ rejects. Upgraded or removed before any pip resolution runs.
-
-2. User site-packages polluting pip's resolver
-   ComfyUI and some custom nodes add user site-packages to sys.path at
-   runtime. PYTHONNOUSERSITE=1 is set in all subprocess environments to
-   prevent pip from seeing these packages during resolution.
-
-3. Locked .pyd files (Windows)
-   When ComfyUI is running, imported packages have their .pyd extension
-   modules locked by Windows. pip cannot replace them. We detect this,
-   skip the locked package if it already satisfies the requirement, and
-   warn the user to restart ComfyUI if a restart is needed.
-
-4. whisperx overwrites CUDA torch
-   whisperx pulls in a CPU-only torch as a transitive dependency. We capture
-   the torch state before, then detect and restore automatically after.
+Why two-phase torch protection?
+--------------------------------
+pip install deep-whisper can break torch independently of whisperx because
+silero-vad (a required deep-whisper dependency) declares its own torch
+requirement. This can cause pip to resolve and install a CPU-only torch even
+before whisperx enters the picture. Capturing the version in step 2 means we
+always know the correct CUDA tag to restore, even if torch is already broken
+by the time setup_gpu runs.
 """
 
-import importlib.metadata
 import os
 import subprocess
 import sys
@@ -39,154 +34,42 @@ TAG = "[ComfyUI-BDC_DeepWhisper]"
 
 
 # ---------------------------------------------------------------------------
-# Packages deep-whisper and its deps need — in install order.
-# Pinned to minimum acceptable versions. We check each one individually so
-# that packages already present at a satisfactory version are never touched.
+# Helpers
 # ---------------------------------------------------------------------------
-REQUIRED_PACKAGES = [
-    # Core pipeline
-    ("faster-whisper",   "faster_whisper",   "1.0.0"),
-    ("whisperx",         "whisperx",          "3.0.0"),
-    ("silero-vad",       "silero_vad",        "5.0.0"),
-    ("librosa",          "librosa",           "0.10.0"),
-    ("soundfile",        "soundfile",         "0.12.0"),
-    ("num2words",        "num2words",         "0.5.13"),
-    ("diff-match-patch", "diff_match_patch",  "20230430"),
-    ("numpy",            "numpy",             "1.24.0"),
-]
-
 
 def clean_env() -> dict:
-    """
-    Return os.environ with PYTHONNOUSERSITE=1.
-    Prevents Python from adding user site-packages to sys.path in subprocesses,
-    which stops pip from seeing packages installed there during resolution.
-    """
+    """os.environ with PYTHONNOUSERSITE=1 to isolate pip from user site-packages."""
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
     return env
 
 
-def is_satisfied(import_name: str, min_version: str) -> bool:
-    """
-    Return True if the package is importable and meets the minimum version.
-    Uses importlib.metadata — checks what's actually installed in this
-    Python environment, not what's on sys.path.
-    """
-    try:
-        installed = importlib.metadata.version(import_name)
-        from packaging.version import Version
-        return Version(installed) >= Version(min_version)
-    except Exception:
-        return False
-
-
-def pip_install(pip_name: str, min_version: str) -> bool:
-    """
-    Install a single package if not already satisfied.
-    Returns True on success, False on failure.
-    Catches WinError 5 (Access Denied / locked file) specifically and
-    reports it as a restart-required condition rather than a hard failure.
-    """
-    result = subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install",
-            "--no-user",
-            f"{pip_name}>={min_version}",
-        ],
+def pip_run(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "pip", *args, "--no-user"],
         env=clean_env(),
-        capture_output=True,
-        text=True,
+        check=True,
     )
-    if result.returncode == 0:
-        return True
-
-    stderr = result.stderr + result.stdout
-    if "WinError 5" in stderr or "Access is denied" in stderr:
-        # Extract the locked filename for a more helpful message
-        locked_file = ""
-        for line in stderr.splitlines():
-            if "WinError 5" in line or "Access is denied" in line:
-                locked_file = line.strip()
-                break
-        print(
-            f"{TAG}   LOCKED: {pip_name} — a .pyd file is in use by the running "
-            f"ComfyUI process.\n"
-            f"{TAG}   {locked_file}\n"
-            f"{TAG}   This package is already loaded — restart ComfyUI to complete "
-            f"the update."
-        )
-        return False
-
-    # Other failure — print output and return False
-    print(f"{TAG}   FAILED: {pip_name}")
-    print(stderr[-800:] if len(stderr) > 800 else stderr)
-    return False
 
 
-def fix_pytorch_lightning() -> None:
-    """
-    Detect and fix pytorch-lightning < 2.0.0 before any pip resolution runs.
-    Versions below 2.0.0 have a malformed version specifier that pip 24.1+
-    rejects regardless of --no-user or PYTHONNOUSERSITE.
-    """
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "show", "pytorch-lightning"],
+def run_py(code: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-c", code],
         capture_output=True, text=True, env=clean_env(),
     )
-    if result.returncode != 0:
-        return
-
-    version = ""
-    for line in result.stdout.splitlines():
-        if line.startswith("Version:"):
-            version = line.split(":", 1)[1].strip()
-            break
-    if not version:
-        return
-
-    try:
-        major = int(version.split(".")[0])
-    except (ValueError, IndexError):
-        major = 0
-
-    if major >= 2:
-        return
-
-    print(
-        f"{TAG} Found pytorch-lightning {version} with invalid pip metadata.\n"
-        f"{TAG} Upgrading before dependency resolution..."
-    )
-    upgrade = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-user",
-         "pytorch-lightning>=2.0.0"],
-        env=clean_env(),
-        capture_output=True, text=True,
-    )
-    if upgrade.returncode == 0:
-        print(f"{TAG} pytorch-lightning upgraded successfully.")
-    else:
-        print(f"{TAG} Upgrade failed — removing pytorch-lightning...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "uninstall", "pytorch-lightning", "-y"],
-            env=clean_env(), check=False,
-        )
-        print(f"{TAG} pytorch-lightning removed.")
 
 
 def get_torch_state() -> Optional[dict]:
-    """Return torch version, CUDA version, and CUDA availability. None if not installed."""
-    result = subprocess.run(
-        [sys.executable, "-c",
-         "import torch; "
-         "print(torch.__version__); "
-         "print(torch.version.cuda or 'None'); "
-         "print(torch.cuda.is_available())"],
-        capture_output=True, text=True, env=clean_env(),
+    """Return torch version, CUDA version, and cuda_available. None if not installed."""
+    r = run_py(
+        "import torch; "
+        "print(torch.__version__); "
+        "print(torch.version.cuda or 'None'); "
+        "print(torch.cuda.is_available())"
     )
-    if result.returncode != 0:
+    if r.returncode != 0:
         return None
-    lines = result.stdout.strip().splitlines()
+    lines = r.stdout.strip().splitlines()
     if len(lines) < 3:
         return None
     return {
@@ -197,11 +80,11 @@ def get_torch_state() -> Optional[dict]:
 
 
 def torch_index_url(cuda_version: str) -> Optional[str]:
-    """Map torch.version.cuda to the matching PyTorch index URL."""
     if not cuda_version or cuda_version == "None":
         return None
     try:
-        major, minor = int(cuda_version.split(".")[0]), int(cuda_version.split(".")[1])
+        major = int(cuda_version.split(".")[0])
+        minor = int(cuda_version.split(".")[1])
     except (ValueError, IndexError):
         return None
     if   major >= 12 and minor >= 8: tag = "cu128"
@@ -213,17 +96,86 @@ def torch_index_url(cuda_version: str) -> Optional[str]:
     return f"https://download.pytorch.org/whl/{tag}"
 
 
-def restore_torch(version: str, index_url: str) -> None:
-    """Force-reinstall the exact original torch + torchaudio CUDA build."""
-    base = version.split("+")[0]
-    print(f"{TAG} Restoring torch=={base} from {index_url} ...")
-    subprocess.run(
+def restore_torch(state: dict) -> bool:
+    """
+    Force-reinstall the exact original torch + torchaudio CUDA build.
+    Returns True on success.
+    """
+    index_url = torch_index_url(state["cuda_version"])
+    if not index_url:
+        print(f"{TAG}   Cannot determine index URL for CUDA {state['cuda_version']}")
+        return False
+    base = state["version"].split("+")[0]
+    print(f"{TAG}   Restoring torch=={base} ({index_url}) ...")
+    result = subprocess.run(
         [sys.executable, "-m", "pip", "install",
          "--no-user", "--force-reinstall",
          "--index-url", index_url,
          f"torch=={base}", f"torchaudio=={base}"],
-        env=clean_env(), check=True,
+        env=clean_env(),
     )
+    return result.returncode == 0
+
+
+def torch_is_broken(before: dict) -> bool:
+    """Return True if torch CUDA has been overwritten since we captured 'before'."""
+    after = get_torch_state()
+    return (
+        after is None
+        or not after["cuda_available"]
+        or after["cuda_version"] != before["cuda_version"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: pytorch-lightning
+# ---------------------------------------------------------------------------
+
+def fix_pytorch_lightning() -> None:
+    """
+    Upgrade/remove pytorch-lightning < 2.0.0.
+    These versions have a malformed version specifier (torch>=1.9.*) that
+    pip 24.1+ rejects during dependency resolution even with --no-user, when
+    the package is present in a sys.path entry added by ComfyUI at startup.
+    """
+    r = run_py("-m pip show pytorch-lightning".split()[0] +
+               " show pytorch-lightning")
+    # Use subprocess directly to avoid the arg-splitting issue
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "show", "pytorch-lightning"],
+        capture_output=True, text=True, env=clean_env(),
+    )
+    if r.returncode != 0:
+        print(f"{TAG}   pytorch-lightning not present — OK")
+        return
+
+    version = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("Version:"):
+            version = line.split(":", 1)[1].strip()
+    if not version:
+        return
+    try:
+        major = int(version.split(".")[0])
+    except (ValueError, IndexError):
+        major = 0
+    if major >= 2:
+        print(f"{TAG}   pytorch-lightning {version} — OK")
+        return
+
+    print(f"{TAG}   pytorch-lightning {version} has invalid metadata — upgrading ...")
+    up = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-user", "pytorch-lightning>=2.0.0"],
+        env=clean_env(), capture_output=True, text=True,
+    )
+    if up.returncode == 0:
+        print(f"{TAG}   pytorch-lightning upgraded.")
+    else:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "pytorch-lightning", "-y"],
+            env=clean_env(), check=False,
+        )
+        print(f"{TAG}   pytorch-lightning removed.")
 
 
 # ---------------------------------------------------------------------------
@@ -232,86 +184,80 @@ def restore_torch(version: str, index_url: str) -> None:
 
 def install() -> None:
 
-    # ── 0. Fix known broken packages before any pip resolution ───────────
-    print(f"{TAG} Checking for known dependency conflicts...")
+    # ── 0. Pre-flight ────────────────────────────────────────────────────
+    print(f"\n{TAG} Checking for known dependency conflicts...")
     fix_pytorch_lightning()
 
-    # ── 1. Capture torch state before whisperx can touch it ──────────────
-    print(f"{TAG} Checking torch state...")
-    before = get_torch_state()
-    if before:
+    # ── 1. Capture torch state before ANY pip installs ───────────────────
+    # pip install deep-whisper can break torch independently of whisperx
+    # because silero-vad (a deep-whisper dependency) declares its own torch
+    # requirement. Capturing NOW means we always have the right CUDA version
+    # to restore, even if torch is already broken when setup_gpu runs.
+    print(f"\n{TAG} Capturing torch state before install...")
+    torch_before = get_torch_state()
+    if torch_before:
         print(
-            f"{TAG}   torch {before['version']}  "
-            f"CUDA {before['cuda_version']}  "
-            f"available={before['cuda_available']}"
+            f"{TAG}   torch {torch_before['version']}  "
+            f"CUDA {torch_before['cuda_version']}  "
+            f"available={torch_before['cuda_available']}"
         )
+        if not torch_before["cuda_available"]:
+            print(f"{TAG}   WARNING: torch CUDA not available before install.")
+            print(f"{TAG}   This may mean torch is already broken or no GPU is present.")
     else:
-        print(f"{TAG}   torch not found — skipping torch protection.")
+        print(f"{TAG}   torch not installed — setup_gpu will handle installation.")
 
-    # ── 2. Install each package individually ─────────────────────────────
-    # Check satisfaction first — only install what's missing or outdated.
-    # This avoids pip trying to touch locked .pyd files that are already
-    # loaded by the running ComfyUI process.
-    print(f"\n{TAG} Installing packages...")
-    needs_restart = []
-    failed        = []
+    # ── 2. Install deep-whisper ───────────────────────────────────────────
+    print(f"\n{TAG} Installing deep-whisper...")
+    try:
+        pip_run("install", "deep-whisper>=0.1.0")
+        print(f"{TAG}   deep-whisper installed.")
+    except subprocess.CalledProcessError as e:
+        print(f"{TAG}   ERROR: deep-whisper installation failed: {e}")
+        print(f"{TAG}   Try installing manually:")
+        print(f"{TAG}     python -m pip install --no-user deep-whisper>=0.1.0")
+        return
 
-    for pip_name, import_name, min_ver in REQUIRED_PACKAGES:
-        if is_satisfied(import_name, min_ver):
-            print(f"{TAG}   OK (already installed):  {pip_name}>={min_ver}")
-            continue
-        print(f"{TAG}   Installing: {pip_name}>={min_ver} ...")
-        ok = pip_install(pip_name, min_ver)
-        if not ok:
-            # Check whether the package is at least loadable at some version.
-            # If it is, the failure was likely a lock — add to restart list.
-            try:
-                importlib.metadata.version(import_name)
-                needs_restart.append(pip_name)
-            except Exception:
-                failed.append(pip_name)
-
-    # ── 3. Detect and repair torch breakage caused by whisperx ───────────
-    if before and before["cuda_available"]:
-        print(f"\n{TAG} Verifying torch CUDA after install...")
-        after = get_torch_state()
-        cuda_broken = (
-            after is None
-            or not after["cuda_available"]
-            or after["cuda_version"] != before["cuda_version"]
-        )
-        if cuda_broken:
-            print(f"{TAG} WARNING: torch CUDA was modified.")
-            index_url = torch_index_url(before["cuda_version"])
-            if index_url:
-                restore_torch(before["version"], index_url)
-                final = get_torch_state()
-                if final and final["cuda_available"]:
-                    print(f"{TAG} torch CUDA restored. ({final['version']} / CUDA {final['cuda_version']})")
-                else:
-                    base = before["version"].split("+")[0]
-                    failed.append(f"torch (manual fix: pip install --force-reinstall "
-                                  f"--index-url {index_url} torch=={base} torchaudio=={base})")
+    # ── 3. Repair torch if pip install broke it ───────────────────────────
+    # Do this BEFORE running setup_gpu so it has a working torch to detect.
+    if torch_before and torch_before["cuda_available"]:
+        print(f"\n{TAG} Verifying torch CUDA after deep-whisper install...")
+        if torch_is_broken(torch_before):
+            print(f"{TAG}   torch CUDA overwritten — repairing before GPU stack install...")
+            ok = restore_torch(torch_before)
+            after = get_torch_state()
+            if ok and after and after["cuda_available"]:
+                print(f"{TAG}   torch restored: {after['version']} / CUDA {after['cuda_version']}")
+            else:
+                print(
+                    f"\n{TAG}   WARNING: Could not restore torch automatically.\n"
+                    f"{TAG}   setup_gpu will attempt to detect and repair on its own,\n"
+                    f"{TAG}   but you may need to reinstall torch manually:\n"
+                    f"{TAG}     python -m pip install --force-reinstall --no-user \\\n"
+                    f"{TAG}       --index-url https://download.pytorch.org/whl/"
+                    f"{torch_index_url(torch_before['cuda_version']) or 'cu128'} \\\n"
+                    f"{TAG}       torch torchaudio"
+                )
         else:
-            print(f"{TAG} torch CUDA intact. ({after['version']} / CUDA {after['cuda_version']})")
+            after = get_torch_state()
+            print(f"{TAG}   torch CUDA intact: {after['version']} / CUDA {after['cuda_version']}")
 
-    # ── 4. Report outcome ─────────────────────────────────────────────────
-    print(f"\n{TAG} {'='*50}")
-    if not needs_restart and not failed:
-        print(f"{TAG} Installation complete — all packages ready.")
+    # ── 4. Run setup_gpu for the full GPU stack ───────────────────────────
+    # Handles: faster-whisper, whisperx (with torch protection), cuDNN,
+    # and final verification. All GPU logic lives in setup_gpu — no duplication.
+    print(f"\n{TAG} Running GPU stack installer (setup_gpu)...")
+    result = subprocess.run(
+        [sys.executable, "-m", "deep_whisper.pipeline.setup_gpu"],
+        env=clean_env(),
+    )
+    if result.returncode != 0:
+        print(
+            f"\n{TAG} GPU stack setup completed with errors.\n"
+            f"{TAG} Check the output above, or run manually:\n"
+            f"{TAG}   python -m deep_whisper.pipeline.setup_gpu"
+        )
     else:
-        if needs_restart:
-            print(f"\n{TAG} RESTART REQUIRED to complete updates for:")
-            for pkg in needs_restart:
-                print(f"{TAG}   - {pkg}")
-            print(f"{TAG} These packages are already loaded by the running ComfyUI")
-            print(f"{TAG} process. Restart ComfyUI — no further action needed.")
-        if failed:
-            print(f"\n{TAG} The following packages failed to install:")
-            for pkg in failed:
-                print(f"{TAG}   - {pkg}")
-            print(f"{TAG} Run install.py manually or check the log above.")
-    print(f"{TAG} {'='*50}\n")
+        print(f"\n{TAG} Installation complete.")
 
 
 install()
