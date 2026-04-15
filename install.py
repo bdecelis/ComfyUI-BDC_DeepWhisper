@@ -81,7 +81,9 @@ def get_torch_state() -> Optional[dict]:
 
 def torch_index_url(cuda_version: str) -> Optional[str]:
     if not cuda_version or cuda_version == "None":
-        return None
+        # Default to cu128
+        major = 12
+        minor = 8
     try:
         major = int(cuda_version.split(".")[0])
         minor = int(cuda_version.split(".")[1])
